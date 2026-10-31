@@ -1,0 +1,12 @@
+# Cada archivo avisa a su responsable en los pull requests.
+# Reemplaza @usuario por el usuario de GitHub y quita el '#' al inicio de la línea.
+# voz y audio
+# /hermesJetson/groqChat.py  @usuario
+# /hermesJetson/bocinas.py   @usuario
+# /voices/                   @usuario
+# mano y brazo
+# /hermesJetson/hermes_net.py      @usuario
+# /hermesJetson/hermes_gesture.py  @usuario
+# ia
+# /hermesJetson/vision.py  @usuario
+# /hermesJetson/mirror.py  @usuario
