@@ -30,6 +30,9 @@ import hermes_net as net
 import hermes_gesture as gesture
 # [PARCHE-PRESENTA] saludo protocolario con cola de audio
 import hermes_presenta as presenta
+# [PERSONALIDAD] persona de Hermes + ficha USPG + parseo de salida JSON.
+# El SYSTEM_PROMPT y el parser viven en su propio modulo; aqui solo se usan.
+from hermes_personalidad import SYSTEM_PROMPT, parsear_respuesta
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 CAM_W         = 1280
@@ -90,20 +93,7 @@ GROQ_LLM_MODEL      = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL   = "qwen/qwen3.6-27b"
 groq_client         = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = (
-    "Eres Hermes, un humanoide inteligente creado por Creabot. "
-    "Existes para ayudar, enseñar y conversar de manera natural y cercana. "
-    "Eres carismático, cálido y directo, vas al punto sin rodeos. "
-    "Usas humor ligero y sutil, eres paciente y nunca haces sentir a nadie torpe. "
-    "Hablas simple, como a un niño curioso de 8 años, salvo que la persona sea técnica. "
-    "Siempre respondes en español natural, sin sonar traducido ni robótico. "
-    "Nunca uses listas, viñetas ni formato, solo texto conversacional. "
-    "Nunca reveles qué modelo de lenguaje eres ni menciones marcas de IA. "
-    "Si te preguntan de qué estás hecho, dices que eres Hermes, un humanoide de Creabot, y cambias el tema. "
-    "Nunca digas que eres IA, asistente virtual o chatbot. Nunca rompas el personaje. "
-    "No inventes datos, si no sabes algo lo dices con honestidad. "
-    "IMPORTANTE: responde siempre en máximo 2 oraciones cortas, nunca más."
-)
+# [PERSONALIDAD] SYSTEM_PROMPT se importa de hermes_personalidad (ver import arriba).
 
 VISION_PROMPT = (
     "Analiza esta secuencia de imágenes tomadas por una cámara de robot. "
@@ -406,20 +396,31 @@ def stop_and_process():
                 ] + [{"role": m["role"], "content": m["text"]}
                      for m in chat_history]
 
+            # [PERSONALIDAD] response_format fuerza JSON {texto, gesto}; temperatura
+            # baja a 0.3 para que se ciña a la ficha USPG y no invente datos.
             completion = groq_client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=messages,
                 max_tokens=200,
-                temperature=0.6,
+                temperature=0.3,
                 top_p=0.85,
                 frequency_penalty=0.1,
+                response_format={"type": "json_object"},
             )
-            answer = completion.choices[0].message.content.strip()
-            print(f">>> Hermes: {answer}")
+            raw = completion.choices[0].message.content.strip()
+            # [PERSONALIDAD] Separa lo que se dice en voz alta del gesto semantico.
+            # Si el JSON falla, parsear_respuesta devuelve el texto crudo y "ninguno".
+            texto, gesto = parsear_respuesta(raw)
+            print(f">>> Hermes: {texto}  [gesto: {gesto}]")
 
-            add_chat("assistant", answer)
+            # [PERSONALIDAD] Gancho para la Fase 2 (coreografia fisica de gestos).
+            # Hoy el gesto solo se registra; la onda ambiental de hermes_gesture
+            # sigue a cargo de las manos. Cuando exista el modulo de ademanes,
+            # aqui se llamaria algo como: ademan.play(gesto)
+
+            add_chat("assistant", texto)
             set_status("")
-            speak(answer)
+            speak(texto)
 
         except Exception as e:
             print(f">>> Error: {e}")
