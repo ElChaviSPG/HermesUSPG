@@ -21,3 +21,19 @@ Cada parte del robot tiene su rama. Trabaja en la tuya y abre un pull request ha
 | `ia` | IA y visión | `vision.py`, `mirror.py` | por definir |
 | `ojos` | Ojos | (en la Raspberry Pi, pendiente) | por definir |
 | `pantalla` | Pantalla | (pendiente) | por definir |
+
+## Cómo trabajar
+
+1. Acepta la invitación al repo (llega por correo o en https://github.com/ElChaviSPG/HermesUSPG/invitations).
+2. Clona y cambia a tu rama (`voz`, `audio`, `mano`, `brazo`, `ia`, `ojos` o `pantalla`):
+
+   ```
+   git clone https://github.com/ElChaviSPG/HermesUSPG.git
+   cd HermesUSPG
+   git switch voz
+   ```
+
+3. Trabaja, haz commit y sube tu rama: `git push origin voz`.
+4. Abre un pull request de tu rama hacia `main`.
+
+Trabaja solo en tu rama y en los archivos de tu parte. No escribas en las ramas de otros ni hagas push directo a `main`.
