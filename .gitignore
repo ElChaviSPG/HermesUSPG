@@ -1,0 +1,6 @@
+.DS_Store
+*.save*
+*.swp
+voices/*.onnx
+__pycache__/
+*.env

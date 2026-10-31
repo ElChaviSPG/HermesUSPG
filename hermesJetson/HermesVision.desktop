@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Hermes Vision
+Comment=Iniciar sistema de visión de Hermes
+Exec=bash -c "source /home/jetson/.profile && source /home/jetson/venv/bin/activate && cd /home/jetson/hermesJetson && python vision.py; exec bash"
+Icon=camera-web
+Terminal=true
+Categories=Utility;
+StartupNotify=true

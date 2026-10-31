@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Hermes Mirror
+Comment=Iniciar sistema de espejo de movimiento de Hermes
+Exec=bash -c "source /home/jetson/venv/bin/activate && cd /home/jetson/hermesJetson && python mirror.py; exec bash"
+Icon=preferences-desktop-accessibility
+Terminal=true
+Categories=Utility;
+StartupNotify=true
