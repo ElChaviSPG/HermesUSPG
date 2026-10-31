@@ -30,6 +30,9 @@ import hermes_net as net
 import hermes_gesture as gesture
 # [PARCHE-PRESENTA] saludo protocolario con cola de audio
 import hermes_presenta as presenta
+# [PERSONALIDAD] persona de Hermes + ficha USPG + parseo de salida JSON.
+# El SYSTEM_PROMPT y el parser viven en su propio modulo; aqui solo se usan.
+from hermes_personalidad import SYSTEM_PROMPT, parsear_respuesta
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 CAM_W         = 1280
@@ -90,20 +93,7 @@ GROQ_LLM_MODEL      = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL   = "qwen/qwen3.6-27b"
 groq_client         = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = (
-    "Eres Hermes, un humanoide inteligente creado por Creabot. "
-    "Existes para ayudar, enseñar y conversar de manera natural y cercana. "
-    "Eres carismático, cálido y directo, vas al punto sin rodeos. "
-    "Usas humor ligero y sutil, eres paciente y nunca haces sentir a nadie torpe. "
-    "Hablas simple, como a un niño curioso de 8 años, salvo que la persona sea técnica. "
-    "Siempre respondes en español natural, sin sonar traducido ni robótico. "
-    "Nunca uses listas, viñetas ni formato, solo texto conversacional. "
-    "Nunca reveles qué modelo de lenguaje eres ni menciones marcas de IA. "
-    "Si te preguntan de qué estás hecho, dices que eres Hermes, un humanoide de Creabot, y cambias el tema. "
-    "Nunca digas que eres IA, asistente virtual o chatbot. Nunca rompas el personaje. "
-    "No inventes datos, si no sabes algo lo dices con honestidad. "
-    "IMPORTANTE: responde siempre en máximo 2 oraciones cortas, nunca más."
-)
+# [PERSONALIDAD] SYSTEM_PROMPT se importa de hermes_personalidad (ver import arriba).
 
 VISION_PROMPT = (
     "Analiza esta secuencia de imágenes tomadas por una cámara de robot. "
@@ -255,27 +245,77 @@ print(f"MIC_DEVICE={MIC_DEVICE}  AUDIO_OUT={AUDIO_OUT}")
 tts_lock    = threading.Lock()
 tts_playing = False
 voice       = None
+_tts_proc   = None   # [BARGE-IN] aplay en curso, para poder cortarlo
+_tts_token  = 0      # [BARGE-IN] id del enunciado vigente; sube al interrumpir
 
 def speak(text):
+    global tts_playing, _tts_token
+    with tts_lock:
+        _tts_token += 1
+        my_token    = _tts_token
+        tts_playing = True
+
     def _run():
-        global tts_playing
-        with tts_lock:
-            tts_playing = True
+        global tts_playing, _tts_proc
+        tmp = None
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
             with wave.open(tmp.name, "wb") as wav_file:
                 voice.synthesize_wav(text, wav_file)
-            subprocess.run(["aplay", "-D", AUDIO_OUT, tmp.name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+            # [BARGE-IN] Si nos interrumpieron durante la sintesis, no reproducir.
             with tts_lock:
-                tts_playing = False
+                cancelado = (my_token != _tts_token)
+            if not cancelado:
+                # Popen + wait (no run): asi stop_speaking() puede matar el aplay.
+                p = subprocess.Popen(["aplay", "-D", AUDIO_OUT, tmp.name],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                with tts_lock:
+                    _tts_proc = p
+                p.wait()
+        except Exception:
+            pass
+        finally:
+            with tts_lock:
+                _tts_proc = None
+                # Solo bajar la bandera si seguimos siendo el enunciado vigente:
+                # si otro speak() o stop_speaking() ya cambio el token, no tocar.
+                if my_token == _tts_token:
+                    tts_playing = False
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
     threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_speaking():
+    """[BARGE-IN] Corta la voz en curso (sintesis o reproduccion) para que
+    Hermes no se oiga a si mismo cuando alguien lo interrumpe. Idempotente."""
+    global tts_playing, _tts_token
+    with tts_lock:
+        _tts_token += 1          # invalida cualquier enunciado en vuelo
+        p           = _tts_proc
+        tts_playing = False
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _interrupt_output():
+    """[BARGE-IN] Silencia lo que Hermes este diciendo (respuesta o presentacion)
+    ANTES de ponerse a escuchar. Asi el microfono no graba su propia voz y
+    cualquiera puede cortarlo para preguntar otra cosa; el historial se conserva,
+    de modo que la conversacion sigue segun la nueva interaccion."""
+    stop_speaking()
+    try:
+        presenta.stop()
+    except Exception:
+        pass
 
 # ─── Chat ─────────────────────────────────────────────────────────────────────
 chat_lock    = threading.Lock()
@@ -406,20 +446,31 @@ def stop_and_process():
                 ] + [{"role": m["role"], "content": m["text"]}
                      for m in chat_history]
 
+            # [PERSONALIDAD] response_format fuerza JSON {texto, gesto}; temperatura
+            # baja a 0.3 para que se ciña a la ficha USPG y no invente datos.
             completion = groq_client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=messages,
                 max_tokens=200,
-                temperature=0.6,
+                temperature=0.3,
                 top_p=0.85,
                 frequency_penalty=0.1,
+                response_format={"type": "json_object"},
             )
-            answer = completion.choices[0].message.content.strip()
-            print(f">>> Hermes: {answer}")
+            raw = completion.choices[0].message.content.strip()
+            # [PERSONALIDAD] Separa lo que se dice en voz alta del gesto semantico.
+            # Si el JSON falla, parsear_respuesta devuelve el texto crudo y "ninguno".
+            texto, gesto = parsear_respuesta(raw)
+            print(f">>> Hermes: {texto}  [gesto: {gesto}]")
 
-            add_chat("assistant", answer)
+            # [PERSONALIDAD] Gancho para la Fase 2 (coreografia fisica de gestos).
+            # Hoy el gesto solo se registra; la onda ambiental de hermes_gesture
+            # sigue a cargo de las manos. Cuando exista el modulo de ademanes,
+            # aqui se llamaria algo como: ademan.play(gesto)
+
+            add_chat("assistant", texto)
             set_status("")
-            speak(answer)
+            speak(texto)
 
         except Exception as e:
             print(f">>> Error: {e}")
@@ -943,6 +994,7 @@ with jtop() as jetson:
         # Lógica de grabación
         if hand_enabled:
             if hand_open and not prev_open and not recording and chat_status == "":
+                _interrupt_output()   # [BARGE-IN] callar antes de grabar
                 start_recording()
 
             rec_elapsed = (time.time() - rec_start_time) if rec_start_time else 0
@@ -1026,6 +1078,7 @@ with jtop() as jetson:
         # mano esta encendida pero falla, Z/X siguen siendo la salida.
         elif key == ord("z"):
             if not recording and chat_status == "":
+                _interrupt_output()   # [BARGE-IN] callar antes de grabar
                 start_recording()
             else:
                 print(">>> Z ignorado (ya grabando o procesando)")
