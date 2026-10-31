@@ -245,27 +245,77 @@ print(f"MIC_DEVICE={MIC_DEVICE}  AUDIO_OUT={AUDIO_OUT}")
 tts_lock    = threading.Lock()
 tts_playing = False
 voice       = None
+_tts_proc   = None   # [BARGE-IN] aplay en curso, para poder cortarlo
+_tts_token  = 0      # [BARGE-IN] id del enunciado vigente; sube al interrumpir
 
 def speak(text):
+    global tts_playing, _tts_token
+    with tts_lock:
+        _tts_token += 1
+        my_token    = _tts_token
+        tts_playing = True
+
     def _run():
-        global tts_playing
-        with tts_lock:
-            tts_playing = True
+        global tts_playing, _tts_proc
+        tmp = None
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
             with wave.open(tmp.name, "wb") as wav_file:
                 voice.synthesize_wav(text, wav_file)
-            subprocess.run(["aplay", "-D", AUDIO_OUT, tmp.name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+            # [BARGE-IN] Si nos interrumpieron durante la sintesis, no reproducir.
             with tts_lock:
-                tts_playing = False
+                cancelado = (my_token != _tts_token)
+            if not cancelado:
+                # Popen + wait (no run): asi stop_speaking() puede matar el aplay.
+                p = subprocess.Popen(["aplay", "-D", AUDIO_OUT, tmp.name],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                with tts_lock:
+                    _tts_proc = p
+                p.wait()
+        except Exception:
+            pass
+        finally:
+            with tts_lock:
+                _tts_proc = None
+                # Solo bajar la bandera si seguimos siendo el enunciado vigente:
+                # si otro speak() o stop_speaking() ya cambio el token, no tocar.
+                if my_token == _tts_token:
+                    tts_playing = False
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
     threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_speaking():
+    """[BARGE-IN] Corta la voz en curso (sintesis o reproduccion) para que
+    Hermes no se oiga a si mismo cuando alguien lo interrumpe. Idempotente."""
+    global tts_playing, _tts_token
+    with tts_lock:
+        _tts_token += 1          # invalida cualquier enunciado en vuelo
+        p           = _tts_proc
+        tts_playing = False
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _interrupt_output():
+    """[BARGE-IN] Silencia lo que Hermes este diciendo (respuesta o presentacion)
+    ANTES de ponerse a escuchar. Asi el microfono no graba su propia voz y
+    cualquiera puede cortarlo para preguntar otra cosa; el historial se conserva,
+    de modo que la conversacion sigue segun la nueva interaccion."""
+    stop_speaking()
+    try:
+        presenta.stop()
+    except Exception:
+        pass
 
 # ─── Chat ─────────────────────────────────────────────────────────────────────
 chat_lock    = threading.Lock()
@@ -944,6 +994,7 @@ with jtop() as jetson:
         # Lógica de grabación
         if hand_enabled:
             if hand_open and not prev_open and not recording and chat_status == "":
+                _interrupt_output()   # [BARGE-IN] callar antes de grabar
                 start_recording()
 
             rec_elapsed = (time.time() - rec_start_time) if rec_start_time else 0
@@ -1027,6 +1078,7 @@ with jtop() as jetson:
         # mano esta encendida pero falla, Z/X siguen siendo la salida.
         elif key == ord("z"):
             if not recording and chat_status == "":
+                _interrupt_output()   # [BARGE-IN] callar antes de grabar
                 start_recording()
             else:
                 print(">>> Z ignorado (ya grabando o procesando)")
