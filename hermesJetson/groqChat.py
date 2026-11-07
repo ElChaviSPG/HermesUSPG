@@ -106,7 +106,7 @@ def find_mic_device(name_hint=MIC_NAME):
                 card_m = re.search(r"card\s+(\d+)", line)
                 dev_m  = re.search(r"device\s+(\d+)", line)
                 if card_m and dev_m:
-                    device = f"hw:{card_m.group(1)},{dev_m.group(1)}"
+                    device = f"plughw:{card_m.group(1)},{dev_m.group(1)}"
                     print(f"Micrófono: {device}")
                     return device
     except Exception as e:
@@ -130,7 +130,7 @@ def find_audio_output(name_hint="USB PnP"):
         print(f"Error buscando audio salida: {e}")
     return "plughw:0,0"
 
-MIC_DEVICE = find_mic_device() or "hw:2,0"
+MIC_DEVICE = find_mic_device() or "plughw:2,0"
 AUDIO_OUT  = find_audio_output()
 print(f"MIC_DEVICE={MIC_DEVICE}  AUDIO_OUT={AUDIO_OUT}")
 
@@ -138,10 +138,14 @@ print(f"MIC_DEVICE={MIC_DEVICE}  AUDIO_OUT={AUDIO_OUT}")
 # Las frases se ponen en una cola y un solo hilo las dice en orden, así nunca
 # se enciman dos respuestas. El audio se manda a aplay frase por frase
 # (streaming), por lo que Hermes empieza a hablar antes de terminar de sintetizar.
+# stop_speaking() lo calla al instante (por ejemplo, cuando alguien abre la mano
+# para preguntar), así el micrófono no graba su propia voz.
 tts_lock     = threading.Lock()
 tts_playing  = False
 voice        = None
 speech_queue = queue.Queue()
+_tts_player  = None   # aplay en curso
+_tts_gen     = 0      # sube cada vez que se calla a Hermes
 
 SYN_CONFIG = SynthesisConfig(
     length_scale=VOICE_LENGTH_SCALE,
@@ -149,8 +153,14 @@ SYN_CONFIG = SynthesisConfig(
     noise_w_scale=VOICE_NOISE_W,
 )
 
+# Símbolos que se deben decir con palabras en vez de borrarse.
+SYMBOL_WORDS = {"+": " más ", "=": " igual a ", "@": " arroba ", "&": " y ",
+                "×": " por ", "÷": " entre ", "$": " dólares ", "€": " euros "}
+
 def clean_for_speech(text):
     """Quita formato, emojis y símbolos que Piper leería mal."""
+    for sym, word in SYMBOL_WORDS.items():
+        text = text.replace(sym, word)
     text = re.sub(r"[*_#`~>\[\]|]", " ", text)
     text = re.sub(r"[^\w\s.,;:¿?¡!'\"()%°-]", " ", text)
     text = re.sub(r"\s+([.,;:?!])", r"\1", text)
@@ -164,7 +174,8 @@ def soften_audio(samples, sample_rate):
     if VOICE_SOFTNESS > 1:
         k = np.hanning(VOICE_SOFTNESS + 2)[1:-1]
         x = np.convolve(x, k / k.sum(), mode="same")
-    peak = float(np.max(np.abs(x))) or 1.0
+    # El mínimo evita subir a todo volumen un fragmento casi en silencio (siseo).
+    peak = max(float(np.max(np.abs(x))), 0.05)
     x = np.tanh(1.5 * x / peak) / np.tanh(1.5) * VOICE_VOLUME
     fade = min(int(sample_rate * 0.01), x.size // 2)
     if fade > 0:
@@ -172,7 +183,12 @@ def soften_audio(samples, sample_rate):
         x[-fade:] *= np.linspace(1.0, 0.0, fade)
     return (x * 32767).astype(np.int16)
 
-def _say(text):
+def _cancelled(gen):
+    with tts_lock:
+        return gen != _tts_gen
+
+def _say(text, gen):
+    global _tts_player
     sample_rate = voice.config.sample_rate
     # Reproducir a una tasa un poco menor baja el tono (voz más grave y calmada).
     play_rate = int(sample_rate * VOICE_PITCH)
@@ -180,43 +196,66 @@ def _say(text):
     player = subprocess.Popen(
         ["aplay", "-q", "-D", AUDIO_OUT, "-t", "raw", "-f", "S16_LE",
          "-c", "1", "-r", str(play_rate)],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    with tts_lock:
+        _tts_player = player
     try:
         for chunk in voice.synthesize(text, syn_config=SYN_CONFIG):
+            # Si nos callaron (también justo antes de arrancar aplay), cortar ya.
+            if _cancelled(gen):
+                player.kill()
+                break
             player.stdin.write(soften_audio(chunk.audio_int16_array, sample_rate).tobytes())
             player.stdin.write(pause)
-    except BrokenPipeError:
-        print(">>> TTS: aplay se cerró antes de tiempo")
+    except OSError:
+        pass   # aplay se cerró (lo callaron o falló); el error se muestra abajo
     finally:
+        with tts_lock:
+            _tts_player = None
         try:
             player.stdin.close()
         except Exception:
             pass
+        err = player.stderr.read()
         player.wait()
+        if player.returncode not in (0, -9, -15) and err:
+            print(f">>> Error de audio (aplay): {err.decode(errors='ignore').strip()}")
 
 def _tts_worker():
     global tts_playing
     while True:
-        text = speech_queue.get()
+        gen, text = speech_queue.get()
+        if not _cancelled(gen):
+            try:
+                _say(text, gen)
+            except Exception as e:
+                print(f">>> Error TTS: {e}")
         with tts_lock:
-            tts_playing = True
-        try:
-            _say(text)
-        except Exception as e:
-            print(f">>> Error TTS: {e}")
-        finally:
-            with tts_lock:
-                tts_playing = speech_queue.qsize() > 0
+            tts_playing = not speech_queue.empty()
 
 threading.Thread(target=_tts_worker, daemon=True).start()
 
 def speak(text):
     global tts_playing
     text = clean_for_speech(text)
-    if text:
-        with tts_lock:
-            tts_playing = True
-        speech_queue.put(text)
+    if not text:
+        return
+    with tts_lock:
+        tts_playing = True
+        speech_queue.put((_tts_gen, text))
+
+def stop_speaking():
+    """Calla a Hermes al instante: descarta lo pendiente y corta el aplay."""
+    global tts_playing, _tts_gen
+    with tts_lock:
+        _tts_gen   += 1
+        tts_playing = False
+        player      = _tts_player
+    if player is not None:
+        try:
+            player.kill()
+        except Exception:
+            pass
 
 # ─── Chat ─────────────────────────────────────────────────────────────────────
 chat_lock    = threading.Lock()
@@ -234,6 +273,21 @@ def set_status(s):
     chat_status = s
 
 # ─── Grabación + STT (Groq Whisper) + LLM (Groq) ─────────────────────────────
+# Whisper a veces "escucha" estas frases cuando solo hay silencio o ruido.
+WHISPER_FANTASMAS = (
+    "amara.org", "subtítulos realizados por", "subtítulos por la comunidad",
+    "gracias por ver el video", "suscríbete", "transcripción de",
+)
+
+def es_transcripcion_valida(text):
+    t = text.lower()
+    if len(re.sub(r"\W", "", t)) < 2:
+        return False
+    return not any(f in t for f in WHISPER_FANTASMAS)
+
+FRASE_NO_ENTENDI = "Perdón, no te escuché bien. ¿Me lo repites, por favor?"
+FRASE_ERROR      = "Ups, tuve un problemita para responderte. ¿Lo intentamos otra vez?"
+
 recording      = False
 rec_start_time = None
 rec_proc       = None
@@ -288,8 +342,10 @@ def stop_and_process():
                    else transcription.text.strip()
             print(f">>> STT: {text}")
 
-            if not text:
+            if not es_transcripcion_valida(text):
+                print(">>> STT vacío o ruido, se descarta")
                 set_status("")
+                speak(FRASE_NO_ENTENDI)
                 return
 
             add_chat("user", text)
@@ -310,8 +366,10 @@ def stop_and_process():
                 top_p=0.85,
                 frequency_penalty=0.1,
             )
-            answer = completion.choices[0].message.content.strip()
+            answer = (completion.choices[0].message.content or "").strip()
             print(f">>> Hermes: {answer}")
+            if not clean_for_speech(answer):
+                answer = FRASE_NO_ENTENDI
 
             add_chat("assistant", answer)
             set_status("")
@@ -321,6 +379,7 @@ def stop_and_process():
             print(f">>> Error: {e}")
             add_chat("assistant", f"[Error: {e}]")
             set_status("")
+            speak(FRASE_ERROR)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -679,9 +738,8 @@ with jtop() as jetson:
 
         # ── Lógica de grabación ──────────────────────────────────────────────
         if hand_enabled:
-            # No grabar mientras Hermes habla, para no captar su propia voz.
-            if (hand_open and not prev_open and not recording
-                    and chat_status == "" and not tts_playing):
+            if hand_open and not prev_open and not recording and chat_status == "":
+                stop_speaking()   # callar antes de grabar, para no oírse a sí mismo
                 start_recording()
 
             rec_elapsed = (time.time() - rec_start_time) if rec_start_time else 0
@@ -770,6 +828,7 @@ with jtop() as jetson:
             menu_selected = (menu_selected + 1) % len(MENU_ITEMS)
 
 # ─── Limpieza ─────────────────────────────────────────────────────────────────
+stop_speaking()
 if recording and rec_proc:
     rec_proc.terminate()
 cap.release()
