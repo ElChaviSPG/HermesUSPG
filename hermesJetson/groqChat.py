@@ -113,22 +113,13 @@ def find_mic_device(name_hint=MIC_NAME):
         print(f"Error buscando micrófono: {e}")
     return None
 
-def find_audio_output(name_hint="USB PnP"):
-    try:
-        import re
-        out = subprocess.check_output(["aplay", "-l"],
-                                      stderr=subprocess.DEVNULL).decode()
-        for line in out.splitlines():
-            if name_hint.lower() in line.lower() and line.startswith("card"):
-                card_m = re.search(r"card\s+(\d+)", line)
-                dev_m  = re.search(r"device\s+(\d+)", line)
-                if card_m and dev_m:
-                    device = f"plughw:{card_m.group(1)},{dev_m.group(1)}"
-                    print(f"Audio salida: {device}")
-                    return device
-    except Exception as e:
-        print(f"Error buscando audio salida: {e}")
-    return "plughw:0,0"
+def find_audio_output():
+    """Salida de audio. Por defecto usa "default" de ALSA, que en el robot es la
+    bocina Bluetooth (igual que vision.py). Para otra bocina, por ejemplo una
+    USB, se cambia sin tocar el código: HERMES_AUDIO_OUT=plughw:1,0"""
+    device = os.environ.get("HERMES_AUDIO_OUT", "default")
+    print(f"Audio salida: {device}")
+    return device
 
 MIC_DEVICE = find_mic_device() or "plughw:2,0"
 AUDIO_OUT  = find_audio_output()
@@ -181,7 +172,18 @@ def soften_audio(samples, sample_rate):
     if fade > 0:
         x[:fade]  *= np.linspace(0.0, 1.0, fade)
         x[-fade:] *= np.linspace(1.0, 0.0, fade)
+    x = lower_pitch(x)
     return (x * 32767).astype(np.int16)
+
+def lower_pitch(x):
+    """Estira el audio para que suene más grave y calmado (VOICE_PITCH < 1).
+    Se hace aquí y no cambiando la tasa de aplay, porque algunas salidas
+    (como la bocina Bluetooth) no aceptan tasas raras."""
+    if VOICE_PITCH == 1.0 or x.size < 2:
+        return x
+    n = x.size
+    m = int(n / VOICE_PITCH)
+    return np.interp(np.linspace(0, n - 1, m), np.arange(n), x).astype(np.float32)
 
 def _cancelled(gen):
     with tts_lock:
@@ -190,12 +192,10 @@ def _cancelled(gen):
 def _say(text, gen):
     global _tts_player
     sample_rate = voice.config.sample_rate
-    # Reproducir a una tasa un poco menor baja el tono (voz más grave y calmada).
-    play_rate = int(sample_rate * VOICE_PITCH)
-    pause     = np.zeros(int(sample_rate * VOICE_PAUSE_S), dtype=np.int16).tobytes()
+    pause = np.zeros(int(sample_rate * VOICE_PAUSE_S), dtype=np.int16).tobytes()
     player = subprocess.Popen(
         ["aplay", "-q", "-D", AUDIO_OUT, "-t", "raw", "-f", "S16_LE",
-         "-c", "1", "-r", str(play_rate)],
+         "-c", "1", "-r", str(sample_rate)],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     with tts_lock:
         _tts_player = player
