@@ -24,25 +24,20 @@ VOICE_NOISE_W      = 0.55
 VOICE_PITCH        = 0.94
 
 # ─── Auto-descubrimiento de salida de audio ───────────────────────────────────
-def find_audio_output(name_hint="USB PnP"):
+def find_audio_output():
+    """Por defecto usa "default" de ALSA, que en el robot es la bocina
+    Bluetooth (igual que vision.py). Para probar otra bocina, por ejemplo una
+    USB de la lista, se usa: HERMES_AUDIO_OUT=plughw:1,0 python bocinas.py"""
     try:
         out = subprocess.check_output(["aplay", "-l"],
                                       stderr=subprocess.DEVNULL).decode()
         print("Dispositivos de salida disponibles:")
         print(out)
-        for line in out.splitlines():
-            if name_hint.lower() in line.lower() and line.startswith("card"):
-                card_m = re.search(r"card\s+(\d+)", line)
-                dev_m  = re.search(r"device\s+(\d+)", line)
-                if card_m and dev_m:
-                    device = f"plughw:{card_m.group(1)},{dev_m.group(1)}"
-                    print(f"→ Usando: {device}")
-                    return device
     except Exception as e:
-        print(f"Error buscando salida: {e}")
-    print(f"AVISO: no encontré la bocina '{name_hint}'. Usando plughw:0,0, "
-          "que puede ser el HDMI u otra salida y no sonar nada.")
-    return "plughw:0,0"
+        print(f"Error listando salidas: {e}")
+    device = os.environ.get("HERMES_AUDIO_OUT", "default")
+    print(f"→ Usando: {device}")
+    return device
 
 AUDIO_OUT = find_audio_output()
 
@@ -54,13 +49,16 @@ def set_volume(percent):
         print("amixer no instalado. Instala con: sudo apt install alsa-utils")
         return False
     percent = max(0, min(100, percent))
-    card_m  = re.search(r":(\d+)", AUDIO_OUT)
-    card    = card_m.group(1) if card_m else "0"
-    for control in ("PCM", "Speaker", "Master", "Headphone"):
+    # Con una tarjeta concreta (plughw:N,M) se usa su mezclador; con
+    # "default" (Bluetooth) se usa el mezclador por defecto del sistema.
+    card_m   = re.search(r"hw:(\d+)", AUDIO_OUT)
+    card_arg = ["-c", card_m.group(1)] if card_m else []
+    card     = card_m.group(1) if card_m else "default"
+    for control in ("Master", "PCM", "Speaker", "Headphone"):
         # Algunos controles no tienen interruptor de silencio; por eso se
         # intenta primero con "unmute" y luego sin él.
         for extra in (["unmute"], []):
-            r = subprocess.run(["amixer", "-c", card, "sset", control,
+            r = subprocess.run(["amixer"] + card_arg + ["sset", control,
                                 f"{percent}%"] + extra,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if r.returncode == 0:
@@ -187,7 +185,12 @@ def test_voz():
         audio = np.concatenate([c.audio_int16_array
                                 for c in voice.synthesize(texto, syn_config=cfg)])
         audio = (audio * 0.85).astype(np.int16)   # Piper sale al máximo; evita saturar
-        play(audio, sample_rate=voice.config.sample_rate * VOICE_PITCH)
+        # Tono más grave estirando el audio (la bocina Bluetooth puede
+        # rechazar tasas raras, así que se reproduce a la tasa normal).
+        n     = audio.size
+        audio = np.interp(np.linspace(0, n - 1, int(n / VOICE_PITCH)),
+                          np.arange(n), audio).astype(np.int16)
+        play(audio, sample_rate=voice.config.sample_rate)
         return
     except AudioError:
         raise   # falla la bocina, no Piper: no tiene caso probar con espeak
