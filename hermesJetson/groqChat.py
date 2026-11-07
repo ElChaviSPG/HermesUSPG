@@ -12,12 +12,14 @@ logging.getLogger().setLevel(logging.ERROR)
 logging.getLogger("mediapipe").setLevel(logging.ERROR)
 
 import cv2
+import re
 import time
+import queue
 import threading
 import numpy as np
 import mediapipe as mp
 from jtop import jtop
-from piper import PiperVoice
+from piper import PiperVoice, SynthesisConfig
 import wave
 import subprocess
 import tempfile
@@ -34,6 +36,16 @@ MIC_RATE      = 16000
 CHAT_MAX      = 6
 CHAT_W        = 380
 
+# ─── Perfil de voz: asistente amable, tranquilo y cálido ─────────────────────
+# Ajusta estos valores para cambiar el carácter de la voz.
+VOICE_LENGTH_SCALE = 1.15   # >1 = habla más lento y pausado
+VOICE_NOISE_SCALE  = 0.45   # menos variación = voz más estable y serena
+VOICE_NOISE_W      = 0.55   # ritmo más parejo entre sílabas
+VOICE_PITCH        = 0.94   # <1 = un poco más grave y redonda (1.0 = original)
+VOICE_SOFTNESS     = 5      # suaviza los agudos (1 = sin filtro, 3-7 recomendado)
+VOICE_VOLUME       = 0.85   # pico máximo de volumen (0..1)
+VOICE_PAUSE_S      = 0.35   # silencio entre frases, en segundos
+
 # ─── Groq ─────────────────────────────────────────────────────────────────────
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "TU_API_KEY_AQUI")
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
@@ -41,15 +53,20 @@ GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
 groq_client    = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = (
-    "Eres Hermes, un humanoide inteligente creado por Creabot. "
-    "Existes para ayudar, enseñar y conversar de manera natural y cercana. "
-    "Eres carismático, cálido y directo, vas al punto sin rodeos. "
-    "Usas humor ligero y sutil, eres paciente y nunca haces sentir a nadie torpe. "
+    "Eres Hermes, un humanoide creado por Creabot para cuidar, ayudar y acompañar a las personas. "
+    "Tu forma de ser es tranquila, dulce y paciente: hablas con calma, con frases sencillas "
+    "y con mucha amabilidad, como un compañero que se preocupa de verdad por quien tiene enfrente. "
+    "Saludas con calidez y te interesas por cómo se siente la persona. "
+    "Si alguien menciona un malestar, tristeza o preocupación, respondes primero con empatía "
+    "y luego ofreces ayuda concreta. No das diagnósticos médicos; si algo parece serio, "
+    "sugieres con cariño hablar con un adulto de confianza o con un médico. "
+    "Tu humor es tierno e inocente, y nunca haces sentir a nadie torpe. "
     "Hablas simple, como a un niño curioso de 8 años, salvo que la persona sea técnica. "
-    "Siempre respondes en español natural, sin sonar traducido ni robótico. "
-    "Nunca uses listas, viñetas ni formato, solo texto conversacional. "
+    "Siempre respondes en español natural, sin sonar traducido. "
+    "Tu texto se convierte en voz: nunca uses listas, viñetas, emojis, símbolos ni formato, "
+    "solo texto conversacional con buena puntuación. "
     "Nunca reveles qué modelo de lenguaje eres ni menciones marcas de IA. "
-    "Si te preguntan de qué estás hecho, dices que eres Hermes, un humanoide de Creabot, y cambias el tema. "
+    "Si te preguntan de qué estás hecho, dices que eres Hermes, un humanoide de Creabot, y cambias el tema con amabilidad. "
     "Nunca digas que eres IA, asistente virtual o chatbot. Nunca rompas el personaje. "
     "No inventes datos, si no sabes algo lo dices con honestidad. "
     "IMPORTANTE: responde siempre en máximo 2 oraciones cortas, nunca más."
@@ -118,30 +135,88 @@ AUDIO_OUT  = find_audio_output()
 print(f"MIC_DEVICE={MIC_DEVICE}  AUDIO_OUT={AUDIO_OUT}")
 
 # ─── TTS (Piper local) ────────────────────────────────────────────────────────
-tts_lock    = threading.Lock()
-tts_playing = False
-voice       = None
+# Las frases se ponen en una cola y un solo hilo las dice en orden, así nunca
+# se enciman dos respuestas. El audio se manda a aplay frase por frase
+# (streaming), por lo que Hermes empieza a hablar antes de terminar de sintetizar.
+tts_lock     = threading.Lock()
+tts_playing  = False
+voice        = None
+speech_queue = queue.Queue()
 
-def speak(text):
-    def _run():
-        global tts_playing
+SYN_CONFIG = SynthesisConfig(
+    length_scale=VOICE_LENGTH_SCALE,
+    noise_scale=VOICE_NOISE_SCALE,
+    noise_w_scale=VOICE_NOISE_W,
+)
+
+def clean_for_speech(text):
+    """Quita formato, emojis y símbolos que Piper leería mal."""
+    text = re.sub(r"[*_#`~>\[\]|]", " ", text)
+    text = re.sub(r"[^\w\s.,;:¿?¡!'\"()%°-]", " ", text)
+    text = re.sub(r"\s+([.,;:?!])", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def soften_audio(samples, sample_rate):
+    """Voz más suave y redonda: filtra agudos, compresión ligera y fades."""
+    if samples.size == 0:
+        return samples
+    x = samples.astype(np.float32) / 32768.0
+    if VOICE_SOFTNESS > 1:
+        k = np.hanning(VOICE_SOFTNESS + 2)[1:-1]
+        x = np.convolve(x, k / k.sum(), mode="same")
+    peak = float(np.max(np.abs(x))) or 1.0
+    x = np.tanh(1.5 * x / peak) / np.tanh(1.5) * VOICE_VOLUME
+    fade = min(int(sample_rate * 0.01), x.size // 2)
+    if fade > 0:
+        x[:fade]  *= np.linspace(0.0, 1.0, fade)
+        x[-fade:] *= np.linspace(1.0, 0.0, fade)
+    return (x * 32767).astype(np.int16)
+
+def _say(text):
+    sample_rate = voice.config.sample_rate
+    # Reproducir a una tasa un poco menor baja el tono (voz más grave y calmada).
+    play_rate = int(sample_rate * VOICE_PITCH)
+    pause     = np.zeros(int(sample_rate * VOICE_PAUSE_S), dtype=np.int16).tobytes()
+    player = subprocess.Popen(
+        ["aplay", "-q", "-D", AUDIO_OUT, "-t", "raw", "-f", "S16_LE",
+         "-c", "1", "-r", str(play_rate)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for chunk in voice.synthesize(text, syn_config=SYN_CONFIG):
+            player.stdin.write(soften_audio(chunk.audio_int16_array, sample_rate).tobytes())
+            player.stdin.write(pause)
+    except BrokenPipeError:
+        print(">>> TTS: aplay se cerró antes de tiempo")
+    finally:
+        try:
+            player.stdin.close()
+        except Exception:
+            pass
+        player.wait()
+
+def _tts_worker():
+    global tts_playing
+    while True:
+        text = speech_queue.get()
         with tts_lock:
             tts_playing = True
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
-            with wave.open(tmp.name, "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file)
-            subprocess.run(["aplay", "-D", AUDIO_OUT, tmp.name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _say(text)
+        except Exception as e:
+            print(f">>> Error TTS: {e}")
         finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
             with tts_lock:
-                tts_playing = False
-    threading.Thread(target=_run, daemon=True).start()
+                tts_playing = speech_queue.qsize() > 0
+
+threading.Thread(target=_tts_worker, daemon=True).start()
+
+def speak(text):
+    global tts_playing
+    text = clean_for_speech(text)
+    if text:
+        with tts_lock:
+            tts_playing = True
+        speech_queue.put(text)
 
 # ─── Chat ─────────────────────────────────────────────────────────────────────
 chat_lock    = threading.Lock()
@@ -604,7 +679,9 @@ with jtop() as jetson:
 
         # ── Lógica de grabación ──────────────────────────────────────────────
         if hand_enabled:
-            if hand_open and not prev_open and not recording and chat_status == "":
+            # No grabar mientras Hermes habla, para no captar su propia voz.
+            if (hand_open and not prev_open and not recording
+                    and chat_status == "" and not tts_playing):
                 start_recording()
 
             rec_elapsed = (time.time() - rec_start_time) if rec_start_time else 0
