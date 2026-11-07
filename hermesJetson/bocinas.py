@@ -11,6 +11,7 @@ import subprocess
 import numpy as np
 import os
 import re
+import shutil
 import sys
 
 SAMPLE_RATE = 44100
@@ -39,33 +40,53 @@ def find_audio_output(name_hint="USB PnP"):
                     return device
     except Exception as e:
         print(f"Error buscando salida: {e}")
+    print(f"AVISO: no encontré la bocina '{name_hint}'. Usando plughw:0,0, "
+          "que puede ser el HDMI u otra salida y no sonar nada.")
     return "plughw:0,0"
 
 AUDIO_OUT = find_audio_output()
 
 # ─── Volumen del sistema (ALSA) ───────────────────────────────────────────────
 def set_volume(percent):
-    """Ajusta el volumen de la tarjeta de AUDIO_OUT. Prueba los nombres de
-    control más comunes porque cambian según la tarjeta USB."""
-    card_m = re.search(r":(\d+)", AUDIO_OUT)
-    card   = card_m.group(1) if card_m else "0"
+    """Ajusta el volumen de la tarjeta de AUDIO_OUT y la quita de silencio.
+    Prueba los nombres de control más comunes porque cambian según la tarjeta."""
+    if not shutil.which("amixer"):
+        print("amixer no instalado. Instala con: sudo apt install alsa-utils")
+        return False
+    percent = max(0, min(100, percent))
+    card_m  = re.search(r":(\d+)", AUDIO_OUT)
+    card    = card_m.group(1) if card_m else "0"
     for control in ("PCM", "Speaker", "Master", "Headphone"):
-        r = subprocess.run(["amixer", "-c", card, "sset", control, f"{percent}%"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode == 0:
-            print(f"Volumen: {control} al {percent}% (tarjeta {card})")
-            return True
+        # Algunos controles no tienen interruptor de silencio; por eso se
+        # intenta primero con "unmute" y luego sin él.
+        for extra in (["unmute"], []):
+            r = subprocess.run(["amixer", "-c", card, "sset", control,
+                                f"{percent}%"] + extra,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                print(f"Volumen: {control} al {percent}% (tarjeta {card})")
+                return True
     print("No se pudo ajustar el volumen con amixer.")
     return False
 
 # ─── Reproducción (sin archivos temporales) ───────────────────────────────────
+class AudioError(Exception):
+    pass
+
 def play(samples, sample_rate=SAMPLE_RATE, channels=1):
-    """Manda audio int16 directo a aplay por stdin."""
-    subprocess.run(
+    """Manda audio int16 directo a aplay por stdin. Si falla, lanza AudioError
+    con el mensaje de aplay (antes fallaba en silencio y el test "pasaba")."""
+    r = subprocess.run(
         ["aplay", "-q", "-D", AUDIO_OUT, "-t", "raw", "-f", "S16_LE",
          "-c", str(channels), "-r", str(int(sample_rate))],
         input=np.ascontiguousarray(samples).tobytes(),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        msg = r.stderr.decode(errors="ignore").strip()
+        if "busy" in msg.lower():
+            msg += ("\n  La bocina está ocupada: cierra vision.py u otro programa "
+                    "que esté usando el audio y vuelve a probar.")
+        raise AudioError(msg or f"aplay terminó con código {r.returncode}")
 
 def to_int16(x):
     return (np.clip(x, -1.0, 1.0) * 32767).astype(np.int16)
@@ -165,8 +186,11 @@ def test_voz():
                                 noise_w_scale=VOICE_NOISE_W)
         audio = np.concatenate([c.audio_int16_array
                                 for c in voice.synthesize(texto, syn_config=cfg)])
+        audio = (audio * 0.85).astype(np.int16)   # Piper sale al máximo; evita saturar
         play(audio, sample_rate=voice.config.sample_rate * VOICE_PITCH)
         return
+    except AudioError:
+        raise   # falla la bocina, no Piper: no tiene caso probar con espeak
     except Exception as e:
         print(f"  Piper no disponible ({e}); probando con espeak.")
     try:
@@ -198,6 +222,8 @@ if __name__ == "__main__":
         if a not in TESTS:
             sys.exit(f"Test desconocido: {a}. Opciones: {', '.join(TESTS)}")
 
+    if not shutil.which("aplay"):
+        sys.exit("aplay no instalado. Instala con: sudo apt install alsa-utils")
     print(f"Salida de audio: {AUDIO_OUT}\n")
     print("Presiona Ctrl+C para detener en cualquier momento.\n")
 
@@ -207,3 +233,5 @@ if __name__ == "__main__":
         print("\n Test completo.")
     except KeyboardInterrupt:
         print("\nTest interrumpido.")
+    except AudioError as e:
+        sys.exit(f"\nNo se pudo reproducir audio en {AUDIO_OUT}:\n  {e}")
